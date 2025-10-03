@@ -2,7 +2,25 @@
 
 A suite of ComfyUI nodes for generating parameter sweep video matrices with labeled grids. Create comprehensive visual comparisons of how different parameter combinations affect your video generation results.
 
-![Example Grid](examples/wan_vace_xy_plot.mp4)
+## Example Output
+
+![Example Grid](examples/wan_vace_xy_plot.png)
+
+**To load the example workflow:** Download and drag [`examples/wan_xy_plot.json`](examples/wan_xy_plot.json) into ComfyUI
+
+[▶️ View Full Video Output](examples/wan_vace_xy_plot.mp4)
+
+*Example: 3x2 parameter sweep grid with labeled axes showing seed and cfg variations*Y Video Plot Suite
+
+A suite of ComfyUI nodes for generating parameter sweep video matrices with labeled grids. Create comprehensive visual comparisons of how different parameter combinations affect your video generation results.
+
+## Example Output
+
+![Example Grid](examples/wan_vace_xy_plot.png)
+
+[▶️ View Full Video](examples/wan_vace_xy_plot.mp4)
+
+*Example: 3x2 parameter sweep grid with labeled axes showing seed and cfg variations*
 
 ## Features
 
