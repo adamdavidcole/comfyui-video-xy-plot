@@ -438,11 +438,11 @@ class XYPlotVideoGrid:
             "required": {
                 "collection_data": ("STRING", {"forceInput": True}),
                 "xy_config": ("STRING", {"forceInput": True}),
-                "thumb_width": ("INT", {"default": 480, "min": 64, "max": 2048}),
-                "thumb_height": ("INT", {"default": 270, "min": 64, "max": 2048}),
+                "max_cell_width": ("INT", {"default": 512, "min": 64, "max": 2048}),
                 "banner_font_size": ("INT", {"default": 20, "min": 1, "max": 128}),
-                "banner_font_color": ("STRING", {"default": "white"}),
-                "banner_bg_color": ("STRING", {"default": "black"}),
+                "label_font_size": ("INT", {"default": 14, "min": 1, "max": 128}),
+                "font_color": ("STRING", {"default": "white"}),
+                "bg_color": ("STRING", {"default": "black"}),
             },
             "optional": {
                 "cleanup_files": ("BOOLEAN", {"default": True}),
@@ -455,9 +455,9 @@ class XYPlotVideoGrid:
     CATEGORY = "VideoPlot"
     OUTPUT_NODE = True
     
-    def create_grid(self, collection_data: str, xy_config: str, thumb_width: int, 
-                   thumb_height: int, banner_font_size: int, banner_font_color: str,
-                   banner_bg_color: str, cleanup_files: bool = True) -> Tuple[torch.Tensor, str]:
+    def create_grid(self, collection_data: str, xy_config: str, max_cell_width: int,
+                   banner_font_size: int, label_font_size: int,
+                   font_color: str, bg_color: str, cleanup_files: bool = True) -> Tuple[torch.Tensor, str]:
         """
         Create video grid from collected videos.
         
@@ -492,15 +492,46 @@ class XYPlotVideoGrid:
         x_labels = sorted(list(set(item['x_label'] for item in file_batch)))
         y_labels = sorted(list(set(item['y_label'] for item in file_batch)))
         
+        # Load first video to detect aspect ratio
+        first_video_path = None
+        for item in file_batch:
+            if os.path.exists(item['filepath']):
+                first_video_path = item['filepath']
+                break
+        
+        if not first_video_path:
+            raise ValueError("No valid video files found")
+        
+        # Detect aspect ratio from first video
+        with VideoFileClip(first_video_path) as probe_clip:
+            original_width = probe_clip.w
+            original_height = probe_clip.h
+            aspect_ratio = original_width / original_height
+            duration = probe_clip.duration
+            fps = probe_clip.fps
+        
+        # Calculate cell dimensions preserving aspect ratio
+        cell_width = max_cell_width
+        cell_height = int(cell_width / aspect_ratio)
+        
+        # Layout margins and spacing
+        left_margin = 15
+        bottom_margin = 15
+        top_padding = 15           # Extra space above/below banner (increased)
+        y_axis_label_width = 60    # For horizontal "Y-Axis" label (was 50px for vertical)
+        y_values_width = 80        # For horizontal Y values (e.g., "2.0", "7.5")
+        x_axis_label_height = 30   # For "X-Axis" centered label
+        x_values_height = 30       # For X values row
+        
         # Create banner text
         banner_text = f"X-Axis: {x_axis_name} | Y-Axis: {y_axis_name}"
-        max_chars = int((num_cols * thumb_width) / (banner_font_size * 0.6))
+        grid_width = num_cols * cell_width
+        max_chars = int(grid_width / (banner_font_size * 0.6))
         wrapped_text = "\n".join(textwrap.wrap(banner_text, width=max_chars if max_chars > 0 else 50))
         
         line_count = wrapped_text.count('\n') + 1
         line_height = banner_font_size * 1.2
-        padding = 20
-        banner_height = int(line_count * line_height + padding)
+        banner_height = int(line_count * line_height + top_padding * 2)  # Add padding top and bottom
         
         # Build grid mapping: [row][col] -> filepath
         grid_map: List[List[Optional[str]]] = [[None for _ in range(num_cols)] for _ in range(num_rows)]
@@ -513,22 +544,17 @@ class XYPlotVideoGrid:
                 col = x_map[item['x_label']]
                 grid_map[row][col] = item['filepath']
         
-        # Load and resize all video clips
+        # Load and resize all video clips to calculated dimensions
         all_clips = []
         for item in file_batch:
             if os.path.exists(item['filepath']):
-                clip = VideoFileClip(item['filepath']).resized(width=thumb_width, height=thumb_height)
+                clip = VideoFileClip(item['filepath']).resized(width=cell_width, height=cell_height)
                 all_clips.append(clip)
             else:
                 print(f"Warning: Video file not found: {item['filepath']}")
         
         if not all_clips:
             raise ValueError("No valid video files found")
-        
-        # Get video properties from first clip
-        first_clip = all_clips[0]
-        duration = first_clip.duration
-        fps = first_clip.fps
         
         # Build rows of clips for grid
         rows_of_clips = []
@@ -543,19 +569,19 @@ class XYPlotVideoGrid:
                         row_clips.append(clip_to_add)
                     else:
                         # Create black placeholder if clip not found
-                        placeholder = ColorClip(size=(thumb_width, thumb_height), color=(0, 0, 0), 
+                        placeholder = ColorClip(size=(cell_width, cell_height), color=(0, 0, 0), 
                                               duration=duration)
                         row_clips.append(placeholder)
                 else:
                     # Create black placeholder for missing videos
-                    placeholder = ColorClip(size=(thumb_width, thumb_height), color=(0, 0, 0), 
+                    placeholder = ColorClip(size=(cell_width, cell_height), color=(0, 0, 0), 
                                           duration=duration)
                     row_clips.append(placeholder)
             rows_of_clips.append(row_clips)
         
         # Pad last row if incomplete
         if len(rows_of_clips[-1]) < num_cols:
-            pad_clip = ColorClip(size=(thumb_width, thumb_height), color=(0, 0, 0), 
+            pad_clip = ColorClip(size=(cell_width, cell_height), color=(0, 0, 0), 
                                duration=duration).with_opacity(0)
             rows_of_clips[-1].extend([pad_clip] * (num_cols - len(rows_of_clips[-1])))
         else:
@@ -564,27 +590,116 @@ class XYPlotVideoGrid:
         # Create grid
         grid_clip = clips_array(rows_of_clips)
         
-        # Create title banner
+        # Get font for labels
         font_to_use = find_default_font()
-        txt_clip = TextClip(
+        
+        # Calculate total dimensions with margins and labels
+        total_label_width = left_margin + y_axis_label_width + y_values_width
+        total_header_height = banner_height + x_axis_label_height + x_values_height
+        grid_content_width = total_label_width + grid_clip.w + left_margin
+        grid_content_height = total_header_height + grid_clip.h + bottom_margin
+        
+        # Create title banner (positioned at top-left corner, spans grid width)
+        # Calculate max width for banner text (grid width + some extra room)
+        banner_max_width = grid_clip.w + y_values_width + y_axis_label_width
+        banner_clip = TextClip(
             text=wrapped_text,
             font=font_to_use,
             font_size=banner_font_size,
-            color=banner_font_color,
-            bg_color=banner_bg_color,
-            size=(grid_clip.w, banner_height),
+            color=font_color,
+            bg_color=bg_color,
+            size=(banner_max_width, banner_height),
+            method='caption'
+        ).with_duration(duration)
+        # Position at actual top-left corner
+        banner_clip = banner_clip.with_position((left_margin, top_padding))
+        
+        # Create X-axis label header (centered above all columns)
+        x_axis_header = TextClip(
+            text=x_axis_name,
+            font=font_to_use,
+            font_size=label_font_size,
+            color=font_color,
+            bg_color=bg_color,
+            size=(grid_clip.w, x_axis_label_height),
+            method='caption'
+        ).with_duration(duration)
+        x_axis_header = x_axis_header.with_position((total_label_width, banner_height))
+        
+        # Create X-axis values (one per column, centered)
+        x_value_clips = []
+        for i, x_label in enumerate(x_labels):
+            # Extract just the value part (e.g., "seed: 1" -> "1")
+            label_text = x_label.split(": ", 1)[1] if ": " in x_label else x_label
+            x_val_clip = TextClip(
+                text=label_text,
+                font=font_to_use,
+                font_size=label_font_size,
+                color=font_color,
+                bg_color=bg_color,
+                size=(cell_width, x_values_height),
+                method='caption'
+            ).with_duration(duration)
+            # Position: after labels, below x-axis header
+            x_pos = total_label_width + (i * cell_width)
+            y_pos = banner_height + x_axis_label_height
+            x_val_clip = x_val_clip.with_position((x_pos, y_pos))
+            x_value_clips.append(x_val_clip)
+        
+        # Create Y-axis label (horizontal, far left, centered vertically on grid)
+        y_axis_label = TextClip(
+            text=y_axis_name,
+            font=font_to_use,
+            font_size=label_font_size,
+            color=font_color,
+            bg_color=bg_color,
+            size=(y_axis_label_width, grid_clip.h),
             method='caption'
         ).with_duration(duration)
         
-        # Composite final video
-        total_height = grid_clip.h + banner_height
-        background = ColorClip(size=(grid_clip.w, total_height), color=(0, 0, 0), duration=duration)
+        # Position: far left, aligned with grid vertically
+        y_label_x = left_margin
+        y_label_y = total_header_height
+        y_axis_label = y_axis_label.with_position((y_label_x, y_label_y))
         
-        final_video = CompositeVideoClip([
+        # Create Y-axis values (horizontal, one per row)
+        y_value_clips = []
+        for i, y_label in enumerate(y_labels):
+            # Extract just the value part
+            label_text = y_label.split(": ", 1)[1] if ": " in y_label else y_label
+            y_val_clip = TextClip(
+                text=label_text,
+                font=font_to_use,
+                font_size=label_font_size,
+                color=font_color,
+                bg_color=bg_color,
+                size=(y_values_width, cell_height),
+                method='caption'
+            ).with_duration(duration)
+            # Position: after y-axis label, aligned with row
+            x_pos = left_margin + y_axis_label_width
+            y_pos = total_header_height + (i * cell_height)
+            y_val_clip = y_val_clip.with_position((x_pos, y_pos))
+            y_value_clips.append(y_val_clip)
+        
+        # Create background
+        background = ColorClip(size=(grid_content_width, grid_content_height), color=(0, 0, 0), duration=duration)
+        
+        # Position the main grid
+        grid_x_pos = total_label_width
+        grid_y_pos = total_header_height
+        grid_positioned = grid_clip.with_position((grid_x_pos, grid_y_pos))
+        
+        # Composite everything
+        all_clips = [
             background,
-            grid_clip.with_position(('center', banner_height)),
-            txt_clip.with_position(('center', 'top'))
-        ])
+            banner_clip,  # Now positioned at top-left instead of centered
+            x_axis_header,
+            y_axis_label,
+            grid_positioned
+        ] + x_value_clips + y_value_clips
+        
+        final_video = CompositeVideoClip(all_clips)
         
         # Render to temporary file and load as tensor
         temp_filepath = os.path.join(

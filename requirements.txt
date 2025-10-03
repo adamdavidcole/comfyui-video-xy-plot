@@ -1,0 +1,9 @@
+# ComfyUI XY Video Plot Suite - Dependencies
+
+# Video processing and grid assembly
+moviepy>=1.0.3
+
+# Already included in ComfyUI base installation:
+# - torch
+# - numpy
+# - pillow
