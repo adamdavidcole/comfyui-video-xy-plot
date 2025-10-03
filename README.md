@@ -14,13 +14,6 @@ A suite of ComfyUI nodes for generating parameter sweep video matrices with labe
 
 A suite of ComfyUI nodes for generating parameter sweep video matrices with labeled grids. Create comprehensive visual comparisons of how different parameter combinations affect your video generation results.
 
-## Example Output
-
-![Example Grid](examples/wan_vace_xy_plot.png)
-
-[▶️ View Full Video](examples/wan_vace_xy_plot.mp4)
-
-*Example: 3x2 parameter sweep grid with labeled axes showing seed and cfg variations*
 
 ## Features
 
