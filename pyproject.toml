@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-video-xy-plot"
 description = "A suite of ComfyUI nodes for generating parameter sweep video matrices with labeled grids. Create comprehensive visual comparisons of how different parameter combinations affect your video generation results."
-version = "1.0.1"
+version = "1.0.3"
 license = {file = "LICENSE"} 
 # classifiers = [
 #     # For OS-independent nodes (works on all operating systems)
