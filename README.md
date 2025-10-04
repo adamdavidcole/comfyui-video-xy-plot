@@ -4,11 +4,11 @@ A suite of ComfyUI nodes for generating parameter sweep video matrices with labe
 
 ## Example Output
 
-![Example Grid](examples/wan_vace_xy_plot.png)
+![Example Grid](examples/wan_grid_steps_cfg.jpg)
 
 **To load the example workflow:** Download and drag [`examples/wan_xy_plot.json`](examples/wan_xy_plot.json) into ComfyUI
 
-[▶️ View Full Video Output](examples/wan_vace_xy_plot.mp4)
+[▶️ View Full Video Output](examples/wan_grid_steps_cfg.mp4)
 
 *Example: 3x2 parameter sweep grid with labeled axes showing seed and cfg variations*Y Video Plot Suite
 
@@ -17,12 +17,12 @@ A suite of ComfyUI nodes for generating parameter sweep video matrices with labe
 
 ## Features
 
-- 🎯 **Parameter Sweep Automation**: Test multiple parameter combinations automatically
-- 📊 **Labeled Grid Output**: Clear X/Y axis labels showing which parameters generated each video
-- 🔄 **For Loop Integration**: Works seamlessly with `comfyui-easy-use` For Loop nodes
-- 🎨 **Customizable Layout**: Adjust cell sizes, fonts, and colors
-- 📦 **Batch Organization**: Optional batch IDs for organized file management
-- 🧹 **Auto Cleanup**: Optionally delete source videos after grid assembly
+- **Parameter Sweep Automation**: Test multiple parameter combinations automatically
+- **Labeled Grid Output**: Clear X/Y axis labels showing which parameters generated each video
+- **For Loop Integration**: Works seamlessly with `comfyui-easy-use` For Loop nodes
+- **Customizable Layout**: Adjust cell sizes, fonts, and colors
+- **Batch Organization**: Optional batch IDs for organized file management
+- **Auto Cleanup**: Optionally delete source videos after grid assembly
 
 ## Installation
 
