@@ -67,6 +67,7 @@ import shutil
 import time
 import numpy as np
 import textwrap
+import subprocess
 from datetime import datetime
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -74,6 +75,7 @@ from moviepy import VideoFileClip, TextClip, CompositeVideoClip, ColorClip, clip
 from PIL import ImageFont
 
 import folder_paths
+import comfy.utils
 
 # ================================================================================
 # UTILITY FUNCTIONS
@@ -98,6 +100,392 @@ def sanitize_filename(text: str) -> str:
 def parse_csv_values(csv_string: str) -> List[str]:
     """Parse comma-separated values, stripping whitespace."""
     return [v.strip() for v in csv_string.split(',') if v.strip()]
+
+def extract_video_metadata(video_path: str) -> Optional[Dict[str, Any]]:
+    """
+    Extract ComfyUI metadata from video file using ffprobe.
+    
+    Returns dictionary with common workflow metadata (model, steps, cfg, prompt, etc.)
+    Returns None if extraction fails or ffprobe is unavailable.
+    """
+    try:
+        # Run ffprobe to get metadata
+        cmd = [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", "-show_streams", video_path
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+        
+        if not result.stdout.strip():
+            return None
+        
+        meta = json.loads(result.stdout)
+        comment = meta.get("format", {}).get("tags", {}).get("comment")
+        
+        if not comment:
+            return None
+        
+        # Extract JSON from comment
+        start = comment.find('{')
+        end = comment.rfind('}')
+        if start == -1 or end == -1 or end <= start:
+            return None
+        
+        comment_str = comment[start:end+1]
+        comment_json = json.loads(comment_str)
+        
+        prompt_block = comment_json.get("prompt")
+        if isinstance(prompt_block, str):
+            prompt_block = json.loads(prompt_block)
+        
+        # Find the sampler node (typically the first or a KSampler node)
+        sampler_node = None
+        sampler_key = None
+        for key, node in prompt_block.items():
+            if node.get("class_type") in ["KSampler", "KSamplerAdvanced"]:
+                sampler_node = node
+                sampler_key = key
+                break
+        
+        if not sampler_node:
+            # Fallback to first node
+            sampler_key = next(iter(prompt_block))
+            sampler_node = prompt_block[sampler_key]
+        
+        inputs = sampler_node.get("inputs", {})
+        
+        # Extract basic sampler parameters
+        steps = inputs.get("steps", "")
+        cfg = inputs.get("cfg", "")
+        seed = inputs.get("seed", "")
+        sampler_name = inputs.get("sampler_name", "")
+        scheduler = inputs.get("scheduler", "")
+        denoise = inputs.get("denoise", "")  # For video-to-video (strength)
+        
+        # Resolve model name
+        model_ptr = inputs.get("model")
+        model_name = _resolve_model_name(prompt_block, model_ptr)
+        
+        # Resolve positive prompt
+        positive_ptr = inputs.get("positive")
+        positive_prompt = _resolve_prompt_text(prompt_block, positive_ptr)
+        
+        # Extract LORA information
+        lora_names = set()
+        for node in prompt_block.values():
+            if node.get("class_type") in ["LoraLoader", "LoraLoaderModelOnly"]:
+                lora_name = node.get("inputs", {}).get("lora_name")
+                if lora_name:
+                    lora_names.add(lora_name)
+        lora_str = ", ".join(sorted(lora_names)) if lora_names else ""
+        
+        # Extract latent dimensions
+        length = width = height = ""
+        latent_ptr = inputs.get("latent_image") or inputs.get("latent")
+        if isinstance(latent_ptr, list) and len(latent_ptr) > 0:
+            latent_key = str(latent_ptr[0])
+            latent_node = prompt_block.get(latent_key, {})
+            latent_inputs = latent_node.get("inputs", {})
+            length = latent_inputs.get("length", "")
+            width = latent_inputs.get("width", "")
+            height = latent_inputs.get("height", "")
+        
+        # Build metadata dictionary
+        meta_dict = {}
+        if positive_prompt: meta_dict["prompt"] = positive_prompt
+        if model_name: meta_dict["model"] = model_name
+        if steps: meta_dict["steps"] = str(steps)
+        if cfg: meta_dict["cfg"] = str(cfg)
+        if sampler_name: meta_dict["sampler"] = sampler_name
+        if scheduler: meta_dict["scheduler"] = scheduler
+        if lora_str: meta_dict["lora"] = lora_str
+        if denoise and denoise != 1.0: meta_dict["strength"] = str(denoise)  # Video-to-video strength
+        if length: meta_dict["length"] = str(length)
+        if width: meta_dict["width"] = str(width)
+        if height: meta_dict["height"] = str(height)
+        if seed: meta_dict["seed"] = str(seed)
+        
+        return meta_dict if meta_dict else None
+        
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, json.JSONDecodeError, KeyError, FileNotFoundError) as e:
+        print(f"Warning: Failed to extract metadata from {video_path}: {e}")
+        return None
+
+def _resolve_model_name(prompt_block: Dict, model_ptr: Any) -> str:
+    """Follow pointer chains to find actual model name."""
+    visited = set()
+    ptr = model_ptr
+    while isinstance(ptr, list) and len(ptr) > 0:
+        key = str(ptr[0])
+        if key in visited:
+            break
+        visited.add(key)
+        node = prompt_block.get(key, {})
+        inputs = node.get("inputs", {})
+        model_name = inputs.get("unet_name") or inputs.get("ckpt_name") or inputs.get("model")
+        if isinstance(model_name, str):
+            return model_name
+        ptr = model_name
+    return str(model_ptr) if model_ptr else ""
+
+def _resolve_prompt_text(prompt_block: Dict, ptr: Any) -> str:
+    """Follow pointer chains to find actual positive prompt text."""
+    visited = set()
+    while isinstance(ptr, list) and len(ptr) > 0:
+        key = str(ptr[0])
+        if key in visited:
+            break
+        visited.add(key)
+        node = prompt_block.get(key, {})
+        if node.get("class_type") == "CLIPTextEncode":
+            return node.get("inputs", {}).get("text", "")
+        ptr = node.get("inputs", {}).get("positive")
+    return ""
+
+def format_metadata_banner(metadata: Dict[str, Any], batch_id: str, x_axis_name: str, y_axis_name: str, 
+                          max_width: int, title_font_size: int, meta_font_size: int) -> Tuple[str, int]:
+    """
+    Format metadata into multi-line banner text with dynamic height calculation.
+    
+    Returns:
+        banner_text: Formatted text with newlines
+        banner_height: Calculated height in pixels
+    """
+    lines = []
+    
+    # Line 1: Batch ID as title (larger font)
+    lines.append(batch_id)
+    
+    # Line 2: Prompt (truncated, smaller font)
+    prompt = metadata.get("prompt", "")
+    if prompt:
+        max_prompt_chars = int(max_width / (meta_font_size * 0.6))
+        if len(prompt) > max_prompt_chars:
+            prompt = prompt[:max_prompt_chars-3] + "..."
+        # Wrap prompt if still too long
+        prompt_lines = textwrap.wrap(prompt, width=max_prompt_chars) if len(prompt) > max_prompt_chars else [prompt]
+        lines.extend(prompt_lines)
+    
+    # Line 3+: Technical parameters (smaller font)
+    tech_params = []
+    
+    # Model info
+    model = metadata.get("model", "")
+    if model:
+        # Shorten model name if too long
+        if len(model) > 40:
+            model = model[:37] + "..."
+        tech_params.append(f"Model: {model}")
+    
+    # Sampler info
+    sampler = metadata.get("sampler", "")
+    scheduler = metadata.get("scheduler", "")
+    if sampler:
+        sampler_str = f"Sampler: {sampler}"
+        if scheduler:
+            sampler_str += f" ({scheduler})"
+        tech_params.append(sampler_str)
+    
+    # Steps and CFG
+    steps = metadata.get("steps", "")
+    cfg = metadata.get("cfg", "")
+    if steps:
+        tech_params.append(f"Steps: {steps}")
+    if cfg:
+        tech_params.append(f"CFG: {cfg}")
+    
+    # Strength (for video-to-video)
+    strength = metadata.get("strength", "")
+    if strength:
+        tech_params.append(f"Strength: {strength}")
+    
+    # Dimensions
+    length = metadata.get("length", "")
+    width = metadata.get("width", "")
+    height = metadata.get("height", "")
+    if length or width or height:
+        dim_str = "Dimensions: "
+        if length:
+            dim_str += f"{length}f"
+        if width and height:
+            dim_str += f" {width}×{height}"
+        tech_params.append(dim_str)
+    
+    # LORA
+    lora = metadata.get("lora", "")
+    if lora:
+        tech_params.append(f"LORA: {lora}")
+    
+    # Join technical parameters with | separator and wrap if needed
+    if tech_params:
+        tech_line = " | ".join(tech_params)
+        max_tech_chars = int(max_width / (meta_font_size * 0.6))
+        tech_wrapped = textwrap.wrap(tech_line, width=max_tech_chars) if len(tech_line) > max_tech_chars else [tech_line]
+        lines.extend(tech_wrapped)
+    
+    # Last line: Axis information (smaller font)
+    lines.append(f"X-Axis: {x_axis_name} | Y-Axis: {y_axis_name}")
+    
+    banner_text = "\n".join(lines)
+    
+    # Calculate height
+    title_lines = 1
+    meta_lines = len(lines) - 1
+    title_line_height = title_font_size * 1.3
+    meta_line_height = meta_font_size * 1.2
+    top_padding = 15
+    bottom_padding = 15
+    
+    banner_height = int(
+        top_padding + 
+        (title_lines * title_line_height) + 
+        (meta_lines * meta_line_height) + 
+        bottom_padding
+    )
+    
+    return banner_text, banner_height
+
+# ================================================================================
+# NODE 0: XYPlotDirectorySetup (OPTIONAL - Directory Organization Helper)
+# ================================================================================
+
+class XYPlotDirectorySetup:
+    """
+    Generate organized directory paths for XY plot outputs.
+    
+    This is an OPTIONAL utility node that helps organize outputs into structured folders.
+    Can be placed between XYPlotSetup and the video generation workflow.
+    
+    Creates directory structure:
+      {folder_prefix}/{batch_id}[-{x_axis}-{y_axis}]/videos/vid-
+      {folder_prefix}/{batch_id}[-{x_axis}-{y_axis}]/grid-{x_axis}-{y_axis}-
+    
+    Also saves minimal metadata JSON for future reference.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "batch_id": ("STRING", {"forceInput": True}),
+                "xy_config": ("STRING", {"forceInput": True}),
+                "folder_prefix": ("STRING", {"default": "grid_", "multiline": False}),
+                "include_axis_names": ("BOOLEAN", {"default": False}),
+                "save_metadata": ("BOOLEAN", {"default": True}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID"
+            }
+        }
+    
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("video_filename_prefix", "grid_filename_prefix", "metadata_path")
+    FUNCTION = "setup_directories"
+    CATEGORY = "VideoPlot"
+    
+    def setup_directories(self, batch_id: str, xy_config: str, folder_prefix: str,
+                         include_axis_names: bool, save_metadata: bool, unique_id=None) -> Tuple[str, str, str]:
+        """
+        Create organized directory structure and return filename prefixes.
+        
+        Args:
+            batch_id: Unique batch identifier from XYPlotSetup
+            xy_config: Configuration JSON from XYPlotSetup
+            folder_prefix: Base folder path (can include subdirectories, e.g., "WanGridTest/")
+            include_axis_names: Whether to include axis names in directory path
+            save_metadata: Whether to save metadata.json file
+            unique_id: Node unique ID for progress bar (hidden input)
+            
+        Returns:
+            video_filename_prefix: Path prefix for individual videos (→ VHS Video Combine)
+            grid_filename_prefix: Path prefix for final grid video (→ VHS Video Combine)
+            metadata_path: Path to metadata.json (empty string if save_metadata=False)
+        """
+        # Initialize progress bar (4 steps total)
+        pbar = comfy.utils.ProgressBar(4, node_id=unique_id)
+        
+        print(f"[XY Plot Directory Setup] Starting directory setup for batch: {batch_id}")
+        pbar.update_absolute(1, 4)
+        
+        # Parse config
+        config = json.loads(xy_config)
+        x_axis_name = sanitize_filename(config["x_axis_name"])
+        y_axis_name = sanitize_filename(config["y_axis_name"])
+        
+        print(f"[XY Plot Directory Setup] Axes: X={config['x_axis_name']}, Y={config['y_axis_name']}")
+        
+        # Build directory path
+        if include_axis_names:
+            dir_name = f"{batch_id}-{x_axis_name}-{y_axis_name}"
+        else:
+            dir_name = batch_id
+        
+        # Determine if folder_prefix should be treated as a directory path or a filename prefix
+        # If it ends with '/', treat as directory. Otherwise, treat as filename prefix.
+        if folder_prefix:
+            if folder_prefix.endswith('/'):
+                # Directory path: "WanGridTest/" -> "WanGridTest/20251004_170219/"
+                full_dir_name = f"{folder_prefix}{dir_name}"
+            else:
+                # Filename prefix: "grid_" -> "grid_20251004_170219/"
+                full_dir_name = f"{folder_prefix}{dir_name}"
+        else:
+            # No prefix: just use dir_name
+            full_dir_name = dir_name
+        
+        pbar.update_absolute(2, 4)
+        
+        base_dir = os.path.join(folder_paths.get_output_directory(), full_dir_name)
+        videos_dir = os.path.join(base_dir, "videos")
+        
+        # Create directories
+        print(f"[XY Plot Directory Setup] Creating directories: {base_dir}")
+        os.makedirs(videos_dir, exist_ok=True)
+        print(f"[XY Plot Directory Setup] ✓ Videos directory: {videos_dir}")
+        
+        pbar.update_absolute(3, 4)
+        
+        # Build filename prefixes (relative paths from ComfyUI output directory)
+        # VHS Video Combine expects paths relative to output directory
+        video_prefix = f"{full_dir_name}/videos/vid-"
+        
+        if include_axis_names:
+            grid_prefix = f"{full_dir_name}/grid-{x_axis_name}-{y_axis_name}-"
+        else:
+            grid_prefix = f"{full_dir_name}/grid-"
+        
+        print(f"[XY Plot Directory Setup] Video prefix: {video_prefix}")
+        print(f"[XY Plot Directory Setup] Grid prefix: {grid_prefix}")
+        
+        # Save metadata if requested
+        metadata_path = ""
+        if save_metadata:
+            metadata = {
+                "batch_id": batch_id,
+                "x_axis": config["x_axis_name"],
+                "y_axis": config["y_axis_name"],
+                "x_values": config["x_values"],
+                "y_values": config["y_values"],
+                "created": datetime.now().isoformat(),
+                "grid_shape": [config["num_rows"], config["num_cols"]],
+                "total_iterations": config["total_iterations"]
+            }
+            
+            metadata_file = os.path.join(base_dir, "grid-metadata.json")
+            with open(metadata_file, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            metadata_path = metadata_file
+            print(f"[XY Plot Directory Setup] ✓ Saved metadata to: {metadata_path}")
+        
+        pbar.update_absolute(4, 4)
+        
+        print(f"[XY Plot Directory Setup] ✓ Setup complete!")
+        print(f"[XY Plot Directory Setup]   Video prefix: {video_prefix}")
+        print(f"[XY Plot Directory Setup]   Grid prefix: {grid_prefix}")
+        
+        return (video_prefix, grid_prefix, metadata_path)
+
 
 # ================================================================================
 # NODE 1: XYPlotSetup
@@ -295,6 +683,9 @@ class XYPlotCollectVideo:
             },
             "optional": {
                 "collection_data": ("STRING", {"default": "[]"}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID"
             }
         }
     
@@ -304,7 +695,7 @@ class XYPlotCollectVideo:
     CATEGORY = "VideoPlot"
     
     def collect(self, video_filepath: str, x_label: str, y_label: str, 
-                xy_config: str, collection_data: str = "[]") -> Tuple[str, str]:
+                xy_config: str, collection_data: str = "[]", unique_id=None) -> Tuple[str, str]:
         """
         Append video info to collection.
         
@@ -314,20 +705,29 @@ class XYPlotCollectVideo:
             y_label: Y axis label for this video
             xy_config: Pass-through config
             collection_data: JSON array from previous iteration (or "[]" if first)
+            unique_id: Node unique ID for progress bar (hidden input)
             
         Returns:
             collection_data: Updated JSON array with new entry appended
             xy_config: Pass-through for next iteration
         """
-        # Parse existing collection
+        # Parse existing collection and config
         try:
             data = json.loads(collection_data)
         except json.JSONDecodeError:
             data = []
         
-        # Validate video file exists
+        config = json.loads(xy_config)
+        total_iterations = config.get("total_iterations", 0)
+        current_iteration = len(data) + 1  # Current video number (1-indexed)
+        
+        # Validate video file exists and log progress
         if not os.path.exists(video_filepath):
-            print(f"Warning: Video file not found: {video_filepath}")
+            print(f"[XY Plot Collect] Warning: Video file not found: {video_filepath}")
+        else:
+            file_size_mb = os.path.getsize(video_filepath) / (1024 * 1024)
+            filename = os.path.basename(video_filepath)
+            print(f"[XY Plot Collect] Video {current_iteration}/{total_iterations} ({x_label}, {y_label}): {filename} ({file_size_mb:.2f} MB)")
         
         # Append new entry
         data.append({
@@ -340,88 +740,7 @@ class XYPlotCollectVideo:
 
 
 # ================================================================================
-# NODE 3B: XYPlotGetValuesTyped (Fallback with Multiple Typed Outputs)
-# ================================================================================
-
-class XYPlotGetValuesTyped:
-    """
-    Alternative to XYPlotGetValues with explicit typed outputs.
-    
-    Use this node if KSampler doesn't accept the dynamic typing from XYPlotGetValues.
-    Outputs all type variations - connect the appropriate one to your parameters.
-    """
-    
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "xy_config": ("STRING", {"forceInput": True}),
-                "loop_index": ("INT", {"forceInput": True, "default": 0}),
-            }
-        }
-    
-    RETURN_TYPES = ("INT", "FLOAT", "STRING", "INT", "FLOAT", "STRING", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("x_int", "x_float", "x_str", "y_int", "y_float", "y_str", "x_label", "y_label", "xy_config")
-    FUNCTION = "get_values_typed"
-    CATEGORY = "VideoPlot"
-    
-    def get_values_typed(self, xy_config: str, loop_index: int) -> Tuple[int, float, str, int, float, str, str, str, str]:
-        """
-        Extract X/Y values with all type variations.
-        
-        Returns:
-            x_int: X as INT
-            x_float: X as FLOAT
-            x_str: X as STRING
-            y_int: Y as INT
-            y_float: Y as FLOAT
-            y_str: Y as STRING
-            x_label, y_label, xy_config: Same as XYPlotGetValues
-        """
-        config = json.loads(xy_config)
-        jobs = config["jobs"]
-        
-        if loop_index >= len(jobs):
-            raise ValueError(f"loop_index {loop_index} out of range (max: {len(jobs)-1})")
-        
-        job = jobs[loop_index]
-        x_str = str(job["x"])
-        y_str = str(job["y"])
-        
-        # Convert X to all types
-        try:
-            x_int = int(float(x_str))
-        except ValueError:
-            x_int = 0
-            print(f"Warning: Could not convert X '{x_str}' to INT")
-        
-        try:
-            x_float = float(x_str)
-        except ValueError:
-            x_float = 0.0
-            print(f"Warning: Could not convert X '{x_str}' to FLOAT")
-        
-        # Convert Y to all types
-        try:
-            y_int = int(float(y_str))
-        except ValueError:
-            y_int = 0
-            print(f"Warning: Could not convert Y '{y_str}' to INT")
-        
-        try:
-            y_float = float(y_str)
-        except ValueError:
-            y_float = 0.0
-            print(f"Warning: Could not convert Y '{y_str}' to FLOAT")
-        
-        x_label = f"{config['x_axis_name']}: {x_str}"
-        y_label = f"{config['y_axis_name']}: {y_str}"
-        
-        return (x_int, x_float, x_str, y_int, y_float, y_str, x_label, y_label, xy_config)
-
-
-# ================================================================================
-# NODE 4: XYPlotCollectVideo
+# NODE 4: XYPlotVideoGrid
 # ================================================================================
 
 class XYPlotVideoGrid:
@@ -445,7 +764,8 @@ class XYPlotVideoGrid:
                 "bg_color": ("STRING", {"default": "black"}),
             },
             "optional": {
-                "cleanup_files": ("BOOLEAN", {"default": True}),
+                "include_metadata": ("BOOLEAN", {"default": True}),
+                "cleanup_files": ("BOOLEAN", {"default": False}),
             }
         }
     
@@ -457,7 +777,8 @@ class XYPlotVideoGrid:
     
     def create_grid(self, collection_data: str, xy_config: str, max_cell_width: int,
                    banner_font_size: int, label_font_size: int,
-                   font_color: str, bg_color: str, cleanup_files: bool = True) -> Tuple[torch.Tensor, str]:
+                   font_color: str, bg_color: str, include_metadata: bool = True, 
+                   cleanup_files: bool = False) -> Tuple[torch.Tensor, str]:
         """
         Create video grid from collected videos.
         
@@ -488,9 +809,10 @@ class XYPlotVideoGrid:
         x_axis_name = config["x_axis_name"]
         y_axis_name = config["y_axis_name"]
         
-        # Get unique sorted labels
-        x_labels = sorted(list(set(item['x_label'] for item in file_batch)))
-        y_labels = sorted(list(set(item['y_label'] for item in file_batch)))
+        # Get labels in original input order (not sorted)
+        # Build labels from original x_values and y_values in config
+        x_labels = [f"{x_axis_name}: {val}" for val in config["x_values"]]
+        y_labels = [f"{y_axis_name}: {val}" for val in config["y_values"]]
         
         # Load first video to detect aspect ratio
         first_video_path = None
@@ -514,6 +836,18 @@ class XYPlotVideoGrid:
         cell_width = max_cell_width
         cell_height = int(cell_width / aspect_ratio)
         
+        # Extract metadata from first video (only if include_metadata is True)
+        batch_id = config.get("batch_id", "XY_Plot")
+        metadata = {}
+        
+        if include_metadata:
+            metadata = extract_video_metadata(first_video_path)
+            if metadata:
+                print(f"Extracted metadata: {metadata}")
+            else:
+                print("No metadata extracted from video (ffprobe may not be available)")
+                metadata = {}
+        
         # Layout margins and spacing
         left_margin = 15
         bottom_margin = 15
@@ -523,15 +857,23 @@ class XYPlotVideoGrid:
         x_axis_label_height = 30   # For "X-Axis" centered label
         x_values_height = 30       # For X values row
         
-        # Create banner text
-        banner_text = f"X-Axis: {x_axis_name} | Y-Axis: {y_axis_name}"
+        # Create banner text (only if metadata is enabled)
         grid_width = num_cols * cell_width
-        max_chars = int(grid_width / (banner_font_size * 0.6))
-        wrapped_text = "\n".join(textwrap.wrap(banner_text, width=max_chars if max_chars > 0 else 50))
+        banner_height = 0
+        banner_text = ""
         
-        line_count = wrapped_text.count('\n') + 1
-        line_height = banner_font_size * 1.2
-        banner_height = int(line_count * line_height + top_padding * 2)  # Add padding top and bottom
+        if include_metadata and metadata:
+            # Use smaller font for metadata lines (banner_font_size for title, label_font_size for details)
+            banner_text, banner_height = format_metadata_banner(
+                metadata, 
+                batch_id, 
+                x_axis_name, 
+                y_axis_name,
+                grid_width,
+                title_font_size=banner_font_size,
+                meta_font_size=label_font_size
+            )
+        # If include_metadata is False, banner_height stays 0 (no banner)
         
         # Build grid mapping: [row][col] -> filepath
         grid_map: List[List[Optional[str]]] = [[None for _ in range(num_cols)] for _ in range(num_rows)]
@@ -599,20 +941,23 @@ class XYPlotVideoGrid:
         grid_content_width = total_label_width + grid_clip.w + left_margin
         grid_content_height = total_header_height + grid_clip.h + bottom_margin
         
-        # Create title banner (positioned at top-left corner, spans grid width)
-        # Calculate max width for banner text (grid width + some extra room)
-        banner_max_width = grid_clip.w + y_values_width + y_axis_label_width
-        banner_clip = TextClip(
-            text=wrapped_text,
-            font=font_to_use,
-            font_size=banner_font_size,
-            color=font_color,
-            bg_color=bg_color,
-            size=(banner_max_width, banner_height),
-            method='caption'
-        ).with_duration(duration)
-        # Position at actual top-left corner
-        banner_clip = banner_clip.with_position((left_margin, top_padding))
+        # Create title banner (only if include_metadata is enabled)
+        banner_clip = None
+        if include_metadata and metadata and banner_height > 0:
+            # Calculate max width for banner text (grid width + some extra room)
+            banner_max_width = grid_clip.w + y_values_width + y_axis_label_width
+            
+            banner_clip = TextClip(
+                text=banner_text,
+                font=font_to_use,
+                font_size=label_font_size,  # Use smaller font for metadata banners
+                color=font_color,
+                bg_color=bg_color,
+                size=(banner_max_width, banner_height),
+                method='caption'
+            ).with_duration(duration)
+            # Position at actual top-left corner
+            banner_clip = banner_clip.with_position((left_margin, top_padding))
         
         # Create X-axis label header (centered above all columns)
         x_axis_header = TextClip(
@@ -690,14 +1035,17 @@ class XYPlotVideoGrid:
         grid_y_pos = total_header_height
         grid_positioned = grid_clip.with_position((grid_x_pos, grid_y_pos))
         
-        # Composite everything
+        # Composite everything (conditionally include banner if it exists)
         all_clips = [
             background,
-            banner_clip,  # Now positioned at top-left instead of centered
             x_axis_header,
             y_axis_label,
             grid_positioned
         ] + x_value_clips + y_value_clips
+        
+        # Add banner clip only if it was created (when include_metadata=True)
+        if banner_clip is not None:
+            all_clips.insert(1, banner_clip)  # Insert after background
         
         final_video = CompositeVideoClip(all_clips)
         
@@ -723,23 +1071,46 @@ class XYPlotVideoGrid:
             output_tensor = torch.stack(frames)
             
         finally:
-            # Cleanup
+            # Cleanup video clips first (important: close before deleting files)
             final_video.close()
             for clip in all_clips:
-                clip.close()
-            if pad_clip is not None:
-                pad_clip.close()
-            if os.path.exists(temp_filepath):
-                os.remove(temp_filepath)
-        
-        # Optional: cleanup source video files
-        if cleanup_files:
-            for item in file_batch:
                 try:
-                    if os.path.exists(item['filepath']):
-                        os.remove(item['filepath'])
+                    clip.close()
                 except Exception as e:
-                    print(f"Warning: Failed to delete {item['filepath']}: {e}")
+                    print(f"Warning: Failed to close clip: {e}")
+            if pad_clip is not None:
+                try:
+                    pad_clip.close()
+                except Exception as e:
+                    print(f"Warning: Failed to close pad clip: {e}")
+            
+            # Delete temporary grid file
+            if os.path.exists(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except Exception as e:
+                    print(f"Warning: Failed to delete temp file {temp_filepath}: {e}")
+        
+        # Optional: cleanup source video files (after all clips are closed)
+        if cleanup_files:
+            import time
+            time.sleep(0.1)  # Give OS time to release file handles
+            for item in file_batch:
+                video_path = item['filepath']
+                try:
+                    # Delete video file
+                    if os.path.exists(video_path):
+                        os.remove(video_path)
+                        print(f"Deleted source video: {video_path}")
+                    
+                    # Delete corresponding PNG file (same name, .png extension)
+                    png_path = os.path.splitext(video_path)[0] + '.png'
+                    if os.path.exists(png_path):
+                        os.remove(png_path)
+                        print(f"Deleted thumbnail: {png_path}")
+                        
+                except Exception as e:
+                    print(f"Warning: Failed to delete {video_path} or its thumbnail: {e}")
         
         # Generate metadata
         metadata = {
@@ -762,16 +1133,16 @@ class XYPlotVideoGrid:
 
 NODE_CLASS_MAPPINGS = {
     "XYPlotSetup": XYPlotSetup,
+    "XYPlotDirectorySetup": XYPlotDirectorySetup,
     "XYPlotGetValues": XYPlotGetValues,
-    "XYPlotGetValuesTyped": XYPlotGetValuesTyped,
     "XYPlotCollectVideo": XYPlotCollectVideo,
     "XYPlotVideoGrid": XYPlotVideoGrid,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "XYPlotSetup": "XY Plot Setup",
+    "XYPlotDirectorySetup": "XY Plot Directory Setup",
     "XYPlotGetValues": "XY Plot Get Values",
-    "XYPlotGetValuesTyped": "XY Plot Get Values (Typed)",
     "XYPlotCollectVideo": "XY Plot Collect Video",
     "XYPlotVideoGrid": "XY Plot Video Grid",
 }
