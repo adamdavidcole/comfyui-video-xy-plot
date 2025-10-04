@@ -5,6 +5,8 @@ A suite of ComfyUI nodes for generating parameter sweep video matrices with labe
 ## Example Output
 
 ![Example Grid](examples/wan_grid_steps_cfg.jpg)
+![Example Setup](examples/example_setup.png)
+
 
 **To load the example workflow:** Download and drag [`examples/wan_xy_plot.json`](examples/wan_xy_plot.json) into ComfyUI
 
