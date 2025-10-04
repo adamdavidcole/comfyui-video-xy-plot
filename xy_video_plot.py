@@ -191,19 +191,26 @@ def extract_video_metadata(video_path: str) -> Optional[Dict[str, Any]]:
             height = latent_inputs.get("height", "")
         
         # Build metadata dictionary
+        # Only include values that are actual scalars, not pointer arrays
         meta_dict = {}
         if positive_prompt: meta_dict["prompt"] = positive_prompt
         if model_name: meta_dict["model"] = model_name
-        if steps: meta_dict["steps"] = str(steps)
-        if cfg: meta_dict["cfg"] = str(cfg)
+        
+        # Only include steps/cfg/etc if they're actual values, not pointers
+        if steps and not isinstance(steps, list): 
+            meta_dict["steps"] = str(steps)
+        if cfg and not isinstance(cfg, list): 
+            meta_dict["cfg"] = str(cfg)
+        
         if sampler_name: meta_dict["sampler"] = sampler_name
         if scheduler: meta_dict["scheduler"] = scheduler
         if lora_str: meta_dict["lora"] = lora_str
-        if denoise and denoise != 1.0: meta_dict["strength"] = str(denoise)  # Video-to-video strength
+        if denoise and denoise != 1.0: meta_dict["strength"] = str(denoise)
         if length: meta_dict["length"] = str(length)
         if width: meta_dict["width"] = str(width)
         if height: meta_dict["height"] = str(height)
-        if seed: meta_dict["seed"] = str(seed)
+        if seed and not isinstance(seed, list): 
+            meta_dict["seed"] = str(seed)
         
         return meta_dict if meta_dict else None
         
@@ -253,8 +260,8 @@ def format_metadata_banner(metadata: Dict[str, Any], batch_id: str, x_axis_name:
     """
     lines = []
     
-    # Line 1: Batch ID as title (larger font)
-    lines.append(batch_id)
+    # Line 1: Batch ID as title (emphasized with brackets for visual weight)
+    lines.append(f"═══ {batch_id.upper()} ═══")
     
     # Line 2: Prompt (truncated, smaller font)
     prompt = metadata.get("prompt", "")
