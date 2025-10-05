@@ -526,6 +526,12 @@ class XYPlotSetup:
     FUNCTION = "setup"
     CATEGORY = "VideoPlot"
     
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Always generate a new batch_id by returning current timestamp
+        # This prevents ComfyUI from caching the node output between queue runs
+        return datetime.now().isoformat()
+    
     def setup(self, x_axis_name: str, y_axis_name: str, x_axis_type: str, y_axis_type: str, 
               x_values: str, y_values: str) -> Tuple[str, int, str, str]:
         """
